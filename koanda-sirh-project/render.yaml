@@ -1,0 +1,39 @@
+# Blueprint Render — à placer à la RACINE du dépôt (koanda-sirh/render.yaml)
+# Déploie TOUT le projet sur Render : l'API (Web Service) + le front (Static Site).
+# Sur render.com : New > Blueprint > sélectionnez le dépôt.
+
+services:
+  # ----------------------------------------------------------------
+  #  Back-end — API FastAPI (Web Service Python)
+  # ----------------------------------------------------------------
+  - type: web
+    name: koanda-sirh-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true        # Render génère une clé aléatoire
+      - key: DEMO_PASSWORD
+        sync: false                # à saisir lors de la création du Blueprint
+      - key: CORS_ORIGINS
+        sync: false                # URL du front, ex. https://koanda-sirh-front.onrender.com
+
+  # ----------------------------------------------------------------
+  #  Front-end — Application Vite/React (Static Site, toujours en ligne)
+  # ----------------------------------------------------------------
+  - type: web
+    name: koanda-sirh-front
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite          # toutes les routes renvoient vers l'app (SPA)
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        sync: false                # URL de l'API, ex. https://koanda-sirh-api.onrender.com
