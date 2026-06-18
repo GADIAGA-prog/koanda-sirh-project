@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie,
   Cell, LineChart, Line, CartesianGrid,
@@ -9,6 +9,23 @@ import {
   TrendingUp, TrendingDown, AlertTriangle, Wallet, Menu, ArrowUpDown,
   CircleUserRound, ChevronDown, Settings, Trash2, RefreshCw, Database, SlidersHorizontal,
 } from "lucide-react";
+import {
+  apiMode, login, logout, getMe, getToken,
+  getFilialesStats, getEmployees, createEmployee, getPayslip,
+  getLeaves, decideLeave,
+  getPayrollConfig, updatePayrollConfig, resetPayrollConfig, previewPayslip,
+  clearDatabase, seedDemo,
+} from "./api";
+
+/* Petit hook utilitaire : valeur débattue (recherche, simulateur…). */
+function useDebounce(value, delay = 350) {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return v;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Identité visuelle                                                  */
@@ -240,13 +257,17 @@ function StatusBadge({ s }) {
 /* ------------------------------------------------------------------ */
 export default function App() {
   const [user, setUser] = useState(null);
-  const [allEmps, setAllEmps] = useState(() => buildWorkforce());
-  const [leaves, setLeaves] = useState(() => buildLeaves(buildWorkforce()));
+  // Fallback en mémoire (apiMode === false) : effectif de démonstration généré localement.
+  // En apiMode, chaque page charge ses propres données via api.js.
+  const [allEmps, setAllEmps] = useState(() => (apiMode ? [] : buildWorkforce()));
+  const [leaves, setLeaves] = useState(() => (apiMode ? [] : buildLeaves(buildWorkforce())));
   const [offres] = useState(() => buildOffres());
   const [payroll, setPayroll] = useState(DEFAULT_PAYROLL);
   const [page, setPage] = useState("dashboard");
-  const [scope, setScope] = useState("ALL"); // pour DRH
+  const [scope, setScope] = useState("ALL"); // périmètre courant (DRH)
   const [mobileNav, setMobileNav] = useState(false);
+  // Restauration de session : on tente getMe() si un token est déjà présent.
+  const [restoring, setRestoring] = useState(apiMode && !!getToken());
 
   useEffect(() => {
     const l = document.createElement("link");
@@ -255,13 +276,46 @@ export default function App() {
     document.head.appendChild(l);
   }, []);
 
-  // périmètre effectif
+  function applyUser(u) {
+    // Affine le libellé de rôle d'un RH avec le nom de sa filiale.
+    return u.scope !== "ALL" && FIL[u.scope]
+      ? { ...u, role: "Responsable RH — " + FIL[u.scope].nom }
+      : u;
+  }
+
+  // Au démarrage : restaure la session si un token JWT est déjà stocké.
+  useEffect(() => {
+    if (!apiMode || !getToken()) return;
+    getMe()
+      .then((u) => { setUser(applyUser(u)); setScope("ALL"); })
+      .catch(() => logout())
+      .finally(() => setRestoring(false));
+  }, []);
+
+  function handleLogin(u) {
+    setUser(applyUser(u));
+    setScope("ALL");
+    setPage("dashboard");
+  }
+
+  function handleLogout() {
+    logout();
+    setUser(null);
+    if (apiMode) { setAllEmps([]); setLeaves([]); }
+  }
+
+  // périmètre effectif (ids de filiales visibles)
   const filIds = useMemo(() => {
     if (!user) return [];
     if (user.scope !== "ALL") return [user.scope];
     return scope === "ALL" ? FILIALES.map((f) => f.id) : [scope];
   }, [user, scope]);
 
+  // Filtre transmis à l'API : seul le DRH « zoomé » envoie un filiale_id
+  // (un RH est déjà restreint à sa filiale par le back-end via son token).
+  const apiFiliale = user && user.scope === "ALL" && scope !== "ALL" ? scope : undefined;
+
+  /* ----- Données et actions du mode mémoire (fallback, apiMode === false) ----- */
   const emps = useMemo(() => allEmps.filter((e) => filIds.includes(e.filialeId)), [allEmps, filIds]);
   const leavesScoped = useMemo(() => leaves.filter((l) => filIds.includes(l.filialeId)), [leaves, filIds]);
   const empById = useMemo(() => Object.fromEntries(allEmps.map((e) => [e.id, e])), [allEmps]);
@@ -275,11 +329,23 @@ export default function App() {
       return { ...l, statut: decision };
     }));
   }
-  function addEmployee(rec) { setAllEmps((es) => [rec, ...es]); }
+  function addEmployee(payload) {
+    const f = FIL[payload.filialeId];
+    const seq = Math.floor(Math.random() * 9000 + 1000);
+    setAllEmps((es) => [{
+      id: "E" + Date.now(), matricule: `${f.court.toUpperCase()}-26-${seq}`,
+      prenom: payload.prenom, nom: payload.nom, genre: payload.genre, filialeId: payload.filialeId,
+      poste: payload.poste, departement: payload.departement, niveau: payload.niveau,
+      typeContrat: payload.typeContrat, salaire: payload.salaire,
+      dateEmbauche: TODAY, cddFin: payload.typeContrat === "CDI" ? null : new Date(TODAY.getTime() + 365 * 864e5),
+      statut: "Actif", soldeConges: 0, email: "", tel: "",
+    }, ...es]);
+  }
   function clearData() { setAllEmps([]); setLeaves([]); }
   function regenData() { const w = buildWorkforce(); setAllEmps(w); setLeaves(buildLeaves(w)); }
 
-  if (!user) return <Login onPick={(u) => { setUser(u); setScope("ALL"); setPage("dashboard"); }} />;
+  if (apiMode && restoring) return <Splash />;
+  if (!user) return <Login onLogin={handleLogin} />;
 
   const isDRH = user.scope === "ALL";
   const nav = [
@@ -318,7 +384,7 @@ export default function App() {
               <div className="text-xs truncate" style={{ color: "#7FA08F" }}>{user.role}</div>
             </div>
           </div>
-          <button onClick={() => setUser(null)} className="mt-1 w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm" style={{ color: "#A9C4B4" }}>
+          <button onClick={handleLogout} className="mt-1 w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm" style={{ color: "#A9C4B4" }}>
             <LogOut size={16} /> Se déconnecter
           </button>
         </div>
@@ -329,9 +395,9 @@ export default function App() {
       <div className="flex-1 min-w-0 flex flex-col">
         <Topbar isDRH={isDRH} user={user} scope={scope} setScope={setScope} onMenu={() => setMobileNav(true)} page={page} />
         <main className="flex-1 p-4 md:p-7 overflow-x-hidden">
-          {page === "dashboard" && <Dashboard isDRH={isDRH} scope={scope} setScope={setScope} setPage={setPage} emps={emps} leaves={leavesScoped} filIds={filIds} empById={empById} onLeave={handleLeave} />}
-          {page === "employes" && <Employes isDRH={isDRH} emps={emps} filIds={filIds} onAdd={addEmployee} userScope={user.scope} payroll={payroll} />}
-          {page === "conges" && <Conges leaves={leavesScoped} empById={empById} onLeave={handleLeave} isDRH={isDRH} />}
+          {page === "dashboard" && <Dashboard isDRH={isDRH} scope={scope} setScope={setScope} setPage={setPage} emps={emps} leaves={leavesScoped} filIds={filIds} empById={empById} onLeave={handleLeave} filiale={apiFiliale} />}
+          {page === "employes" && <Employes isDRH={isDRH} emps={emps} filIds={filIds} onAdd={addEmployee} userScope={user.scope} payroll={payroll} filiale={apiFiliale} />}
+          {page === "conges" && <Conges leaves={leavesScoped} empById={empById} onLeave={handleLeave} isDRH={isDRH} filiale={apiFiliale} />}
           {page === "recrutement" && <Recrutement offres={offres.filter((o) => filIds.includes(o.filialeId))} isDRH={isDRH} />}
           {page === "analytique" && <Analytique isDRH={isDRH} emps={emps} filIds={filIds} />}
           {page === "filiales" && isDRH && <Filiales allEmps={allEmps} setScope={setScope} setPage={setPage} />}
@@ -394,8 +460,97 @@ function Topbar({ isDRH, user, scope, setScope, onMenu, page }) {
   );
 }
 
+/* --------------------------- Splash --------------------------- */
+function Splash() {
+  return (
+    <div style={{ fontFamily: SANS, background: T.brandDeep, minHeight: "100vh" }} className="flex flex-col items-center justify-center gap-3">
+      <div className="flex items-center justify-center rounded-lg" style={{ width: 48, height: 48, background: T.gold }}>
+        <span style={{ fontFamily: DISPLAY, fontWeight: 700, color: T.brandDeep, fontSize: 24 }}>K</span>
+      </div>
+      <div className="flex items-center gap-2 text-sm" style={{ color: "#7FA08F" }}>
+        <RefreshCw size={15} className="animate-spin" /> Restauration de la session…
+      </div>
+    </div>
+  );
+}
+
 /* ----------------------------- Login ----------------------------- */
-function Login({ onPick }) {
+function Login({ onLogin }) {
+  // Avec back-end : vrai login JWT. Sinon : sélection d'un profil de démonstration.
+  return apiMode ? <LoginForm onLogin={onLogin} /> : <LoginPicker onLogin={onLogin} />;
+}
+
+function BrandHeader() {
+  return (
+    <div className="flex items-center gap-3 mb-7">
+      <div className="flex items-center justify-center rounded-lg" style={{ width: 44, height: 44, background: T.gold }}>
+        <span style={{ fontFamily: DISPLAY, fontWeight: 700, color: T.brandDeep, fontSize: 22 }}>K</span>
+      </div>
+      <div>
+        <div style={{ fontFamily: DISPLAY, fontWeight: 700, color: "#fff", fontSize: 22, lineHeight: 1.1 }}>Koanda Group · SIRH</div>
+        <div style={{ color: "#7FA08F", fontSize: 13 }}>Plateforme de gestion du capital humain — Burkina Faso</div>
+      </div>
+    </div>
+  );
+}
+
+function LoginForm({ onLogin }) {
+  const [email, setEmail] = useState("drh@koanda-group.bf");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const u = await login(email.trim(), password);
+      onLogin(u);
+    } catch (ex) {
+      setErr(ex.message || "Connexion impossible");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const inp = { background: "#0B2117", border: "1px solid #1D3A2A", color: "#fff" };
+  return (
+    <div style={{ fontFamily: SANS, background: T.brandDeep, minHeight: "100vh" }} className="flex items-center justify-center p-4">
+      <div className="w-full max-w-sm">
+        <BrandHeader />
+        <form onSubmit={submit} className="rounded-2xl p-6 space-y-4" style={{ background: "#0E2A1D", border: "1px solid #163225" }}>
+          <div>
+            <div className="text-white font-semibold mb-1" style={{ fontFamily: DISPLAY }}>Connexion</div>
+            <p className="text-xs" style={{ color: "#7FA08F" }}>Accédez à votre espace RH avec vos identifiants.</p>
+          </div>
+          <label className="block space-y-1">
+            <span className="text-xs" style={{ color: "#A9C4B4" }}>Email</span>
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="username" required
+              className="w-full rounded-lg px-3 py-2.5 text-sm outline-none" style={inp} />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-xs" style={{ color: "#A9C4B4" }}>Mot de passe</span>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required
+              className="w-full rounded-lg px-3 py-2.5 text-sm outline-none" style={inp} />
+          </label>
+          {err && (
+            <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: "rgba(178,58,72,.18)", color: "#F1B9C0" }}>
+              <AlertTriangle size={14} /> {err}
+            </div>
+          )}
+          <button type="submit" disabled={busy} className="w-full flex items-center justify-center gap-2 rounded-lg py-2.5 text-sm font-semibold text-white disabled:opacity-60" style={{ background: T.primary }}>
+            {busy ? <><RefreshCw size={15} className="animate-spin" /> Connexion…</> : "Se connecter"}
+          </button>
+        </form>
+        <p className="text-center text-xs mt-4" style={{ color: "#5E7A6B" }}>Démo — DRH : drh@koanda-group.bf · RH : rh.&lt;filiale&gt;@koanda-group.bf</p>
+      </div>
+    </div>
+  );
+}
+
+function LoginPicker({ onLogin }) {
   const drh = USERS[0];
   return (
     <div style={{ fontFamily: SANS, background: T.brandDeep, minHeight: "100vh" }} className="flex items-center justify-center p-4">
@@ -411,7 +566,7 @@ function Login({ onPick }) {
         </div>
 
         <div className="rounded-2xl p-2" style={{ background: "#0E2A1D", border: "1px solid #163225" }}>
-          <button onClick={() => onPick(drh)} className="w-full text-left rounded-xl p-4 mb-2 flex items-center gap-4 transition-transform hover:scale-[1.01]" style={{ background: "linear-gradient(90deg,#0F6B49,#0A3D2A)" }}>
+          <button onClick={() => onLogin(drh)} className="w-full text-left rounded-xl p-4 mb-2 flex items-center gap-4 transition-transform hover:scale-[1.01]" style={{ background: "linear-gradient(90deg,#0F6B49,#0A3D2A)" }}>
             <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 46, height: 46, background: T.gold, color: T.brandDeep, fontWeight: 700, fontFamily: DISPLAY }}>AK</div>
             <div className="flex-1">
               <div className="text-white font-semibold flex items-center gap-2">{drh.name} <span className="rounded-full px-2 py-0.5 text-xs" style={{ background: T.gold, color: T.brandDeep }}>Accès groupe</span></div>
@@ -425,7 +580,7 @@ function Login({ onPick }) {
             {USERS.slice(1).map((u) => {
               const f = FIL[u.scope];
               return (
-                <button key={u.id} onClick={() => onPick(u)} className="text-left rounded-xl p-3 flex items-center gap-3 transition-colors hover:bg-white/5" style={{ background: "#0B2117", border: "1px solid #163225" }}>
+                <button key={u.id} onClick={() => onLogin(u)} className="text-left rounded-xl p-3 flex items-center gap-3 transition-colors hover:bg-white/5" style={{ background: "#0B2117", border: "1px solid #163225" }}>
                   <span style={{ width: 10, height: 10, borderRadius: 99, background: f.color, flex: "none" }} />
                   <div className="min-w-0">
                     <div className="text-white text-sm font-medium truncate">{u.name}</div>
@@ -443,15 +598,73 @@ function Login({ onPick }) {
 }
 
 /* --------------------------- Dashboard --------------------------- */
-function Dashboard({ isDRH, scope, setScope, setPage, emps, leaves, filIds, empById, onLeave }) {
-  const effectif = emps.length;
-  const masse = emps.reduce((s, e) => s + e.salaire, 0);
-  const enAttente = leaves.filter((l) => l.statut === "En attente");
-  const cddEcheance = emps.filter((e) => e.cddFin && daysTo(e.cddFin) >= 0 && daysTo(e.cddFin) <= 90);
-  const femmes = effectif ? Math.round((emps.filter((e) => e.genre === "F").length / effectif) * 100) : 0;
-  const ancMoy = effectif ? (emps.reduce((s, e) => s + (TODAY - e.dateEmbauche), 0) / effectif / (365.25 * 864e5)).toFixed(1) : 0;
+function Dashboard({ isDRH, scope, setScope, setPage, emps, leaves, filIds, empById, onLeave, filiale }) {
+  const [stats, setStats] = useState(null);
+  const [apiLeaves, setApiLeaves] = useState([]);
+  const [loading, setLoading] = useState(apiMode);
+  const [error, setError] = useState(null);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const [st, lv] = await Promise.all([
+        getFilialesStats(),
+        getLeaves({ statut: "En attente", filialeId: filiale }),
+      ]);
+      setStats(st);
+      setApiLeaves(lv);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { if (apiMode) load(); }, [filiale]); // eslint-disable-line
+
+  async function decide(id, decision) {
+    try { await decideLeave(id, decision); await load(); }
+    catch (e) { setError(e.message); }
+  }
+
+  // Données unifiées par filiale (effectif / masse / congés en attente),
+  // calculées soit depuis /filiales/stats (apiMode), soit depuis la mémoire.
+  let byFil, effectif, masse, queue;
+  if (apiMode) {
+    byFil = (stats || [])
+      .filter((s) => filIds.includes(s.filialeId))
+      .map((s) => ({ f: FIL[s.filialeId], effectif: s.effectif, masse: s.masseSalariale, attente: s.congesEnAttente }))
+      .filter((x) => x.f);
+    effectif = byFil.reduce((a, b) => a + b.effectif, 0);
+    masse = byFil.reduce((a, b) => a + b.masse, 0);
+    queue = apiLeaves.map((l) => ({ ...l, nom: l.employeNom || "—" }));
+  } else {
+    byFil = FILIALES.filter((f) => filIds.includes(f.id)).map((f) => {
+      const fe = emps.filter((e) => e.filialeId === f.id);
+      return {
+        f, effectif: fe.length, masse: fe.reduce((s, e) => s + e.salaire, 0),
+        attente: leaves.filter((l) => l.filialeId === f.id && l.statut === "En attente").length,
+      };
+    });
+    effectif = emps.length;
+    masse = emps.reduce((s, e) => s + e.salaire, 0);
+    queue = leaves.filter((l) => l.statut === "En attente").map((l) => {
+      const e = empById[l.empId];
+      return { ...l, nom: e ? `${e.prenom} ${e.nom}` : "—" };
+    });
+  }
+
+  const enAttenteTotal = byFil.reduce((a, b) => a + b.attente, 0);
+  const decideFn = apiMode ? decide : onLeave;
   const wAbs = filIds.reduce((s, id) => s + FIL[id].abs * FIL[id].head, 0) / filIds.reduce((s, id) => s + FIL[id].head, 0);
   const wTurn = filIds.reduce((s, id) => s + FIL[id].turn * FIL[id].head, 0) / filIds.reduce((s, id) => s + FIL[id].head, 0);
+
+  // KPIs nécessitant le détail collaborateur (non fournis par /filiales/stats).
+  const cddEcheance = apiMode ? null : emps.filter((e) => e.cddFin && daysTo(e.cddFin) >= 0 && daysTo(e.cddFin) <= 90).length;
+  const femmes = apiMode ? null : (emps.length ? Math.round((emps.filter((e) => e.genre === "F").length / emps.length) * 100) : 0);
+  const ancMoy = apiMode ? null : (emps.length ? (emps.reduce((s, e) => s + (TODAY - e.dateEmbauche), 0) / emps.length / (365.25 * 864e5)).toFixed(1) : 0);
+
+  const consolidated = isDRH && scope === "ALL";
 
   return (
     <div className="space-y-6">
@@ -461,31 +674,48 @@ function Dashboard({ isDRH, scope, setScope, setPage, emps, leaves, filIds, empB
             {isDRH ? (scope === "ALL" ? "Vue consolidée du groupe" : FIL[scope].nom) : FIL[filIds[0]].nom}
           </h2>
           <p className="text-sm" style={{ color: T.muted }}>
-            {isDRH && scope === "ALL" ? `${FILIALES.length} filiales · ${fInt(effectif)} collaborateurs` : `${FIL[filIds[0]].secteur} · ${FIL[filIds[0]].ville}`}
+            {consolidated ? `${byFil.length || FILIALES.length} filiales · ${fInt(effectif)} collaborateurs` : `${FIL[filIds[0]].secteur} · ${FIL[filIds[0]].ville}`}
           </p>
         </div>
-        <span className="text-xs px-2.5 py-1 rounded-full" style={{ background: T.surface, border: `1px solid ${T.line}`, color: T.muted }}>Données au {fDate(TODAY)}</span>
+        <span className="text-xs px-2.5 py-1 rounded-full inline-flex items-center gap-1.5" style={{ background: T.surface, border: `1px solid ${T.line}`, color: T.muted }}>
+          {loading && <RefreshCw size={12} className="animate-spin" />} Données au {fDate(TODAY)}
+        </span>
       </div>
+
+      {error && <ErrorNote msg={error} onClose={() => setError(null)} />}
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <Kpi icon={Users} label="Effectif total" value={fInt(effectif)} sub="collaborateurs" tone="primary" />
         <Kpi icon={Wallet} label="Masse salariale" value={fM(masse) + " M"} sub="FCFA brut / mois" tone="gold" />
-        <Kpi icon={CalendarDays} label="Congés à traiter" value={enAttente.length} sub="demandes en attente" tone={enAttente.length ? "gold" : "primary"} />
-        <Kpi icon={AlertTriangle} label="CDD à échéance" value={cddEcheance.length} sub="< 90 jours" tone={cddEcheance.length ? "danger" : "primary"} />
+        <Kpi icon={CalendarDays} label="Congés à traiter" value={enAttenteTotal} sub="demandes en attente" tone={enAttenteTotal ? "gold" : "primary"} />
+        {apiMode
+          ? <Kpi icon={Building2} label="Filiales suivies" value={byFil.length} sub="dans le périmètre" tone="primary" />
+          : <Kpi icon={AlertTriangle} label="CDD à échéance" value={cddEcheance} sub="< 90 jours" tone={cddEcheance ? "danger" : "primary"} />}
       </div>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <MiniStat label="Absentéisme" value={wAbs.toFixed(1) + " %"} trend="down" />
         <MiniStat label="Turnover annualisé" value={wTurn.toFixed(0) + " %"} trend="up" />
-        <MiniStat label="Part des femmes" value={femmes + " %"} />
-        <MiniStat label="Ancienneté moyenne" value={ancMoy + " ans"} />
+        {apiMode ? (
+          <>
+            <MiniStat label="Demandes en attente" value={fInt(enAttenteTotal)} />
+            <MiniStat label="Masse moy. / filiale" value={fM(byFil.length ? masse / byFil.length : 0) + " M"} />
+          </>
+        ) : (
+          <>
+            <MiniStat label="Part des femmes" value={femmes + " %"} />
+            <MiniStat label="Ancienneté moyenne" value={ancMoy + " ans"} />
+          </>
+        )}
       </div>
 
       <div className="grid lg:grid-cols-3 gap-4">
         {/* Signature : barre consolidée */}
         <div className="lg:col-span-2 rounded-2xl p-5" style={{ background: T.surface, border: `1px solid ${T.line}` }}>
-          {isDRH && scope === "ALL" ? (
-            <ConsolidatedBar emps={emps} setScope={setScope} />
+          {consolidated ? (
+            <ConsolidatedBar byFil={byFil} setScope={setScope} />
+          ) : apiMode ? (
+            <FilialeFocus row={byFil[0]} />
           ) : (
             <DeptBreakdown emps={emps} title="Répartition par département" />
           )}
@@ -497,31 +727,53 @@ function Dashboard({ isDRH, scope, setScope, setPage, emps, leaves, filIds, empB
             <h3 className="font-semibold" style={{ fontFamily: DISPLAY }}>À valider</h3>
             <button onClick={() => setPage("conges")} className="text-xs font-medium" style={{ color: T.primary }}>Tout voir</button>
           </div>
-          {enAttente.length === 0 && <div className="text-sm py-8 text-center" style={{ color: T.muted }}>Aucune demande en attente. File à jour.</div>}
+          {queue.length === 0 && <div className="text-sm py-8 text-center" style={{ color: T.muted }}>Aucune demande en attente. File à jour.</div>}
           <div className="space-y-2.5 overflow-y-auto" style={{ maxHeight: 320 }}>
-            {enAttente.slice(0, 6).map((l) => {
-              const e = empById[l.empId];
-              return (
-                <div key={l.id} className="rounded-xl p-3" style={{ background: T.bg }}>
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium truncate">{e.prenom} {e.nom}</div>
-                      <div className="text-xs" style={{ color: T.muted }}>{l.type} · {l.jours} j · dès le {fDate(l.debut)}</div>
-                    </div>
-                    {isDRH && scope === "ALL" && <FilialeDot id={l.filialeId} />}
+            {queue.slice(0, 6).map((l) => (
+              <div key={l.id} className="rounded-xl p-3" style={{ background: T.bg }}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium truncate">{l.nom}</div>
+                    <div className="text-xs" style={{ color: T.muted }}>{l.type} · {l.jours} j · dès le {fDate(l.debut)}</div>
                   </div>
-                  <div className="flex gap-2 mt-2">
-                    <button onClick={() => onLeave(l.id, "Approuvé")} className="flex-1 flex items-center justify-center gap-1 rounded-lg py-1.5 text-xs font-semibold" style={{ background: T.primary, color: "#fff" }}><Check size={13} /> Approuver</button>
-                    <button onClick={() => onLeave(l.id, "Refusé")} className="flex-1 flex items-center justify-center gap-1 rounded-lg py-1.5 text-xs font-semibold" style={{ background: "#fff", border: `1px solid ${T.line}`, color: T.danger }}><X size={13} /> Refuser</button>
-                  </div>
+                  {consolidated && <FilialeDot id={l.filialeId} />}
                 </div>
-              );
-            })}
+                <div className="flex gap-2 mt-2">
+                  <button onClick={() => decideFn(l.id, "Approuvé")} className="flex-1 flex items-center justify-center gap-1 rounded-lg py-1.5 text-xs font-semibold" style={{ background: T.primary, color: "#fff" }}><Check size={13} /> Approuver</button>
+                  <button onClick={() => decideFn(l.id, "Refusé")} className="flex-1 flex items-center justify-center gap-1 rounded-lg py-1.5 text-xs font-semibold" style={{ background: "#fff", border: `1px solid ${T.line}`, color: T.danger }}><X size={13} /> Refuser</button>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       </div>
 
-      {isDRH && scope === "ALL" && <FilialeComparison emps={emps} leaves={leaves} setScope={setScope} setPage={setPage} />}
+      {consolidated && <FilialeComparison byFil={byFil} setScope={setScope} setPage={setPage} />}
+    </div>
+  );
+}
+
+function ErrorNote({ msg, onClose }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-xl px-4 py-3 text-sm" style={{ background: T.dangerSoft, color: T.danger }}>
+      <span className="flex items-center gap-2"><AlertTriangle size={16} /> {msg}</span>
+      {onClose && <button onClick={onClose} aria-label="Fermer"><X size={16} /></button>}
+    </div>
+  );
+}
+
+function FilialeFocus({ row }) {
+  if (!row) return <div className="py-10 text-center text-sm" style={{ color: T.muted }}>Aucune donnée pour ce périmètre.</div>;
+  const { f, effectif, masse, attente } = row;
+  return (
+    <div>
+      <h3 className="font-semibold mb-1" style={{ fontFamily: DISPLAY }}>{f.nom}</h3>
+      <p className="text-xs mb-4" style={{ color: T.muted }}>{f.secteur} · {f.ville}</p>
+      <div className="grid grid-cols-3 gap-2">
+        <Mini k="Effectif" v={fInt(effectif)} />
+        <Mini k="Masse (M)" v={fM(masse)} />
+        <Mini k="À valider" v={fInt(attente)} />
+      </div>
     </div>
   );
 }
@@ -553,9 +805,8 @@ function MiniStat({ label, value, trend }) {
   );
 }
 
-function ConsolidatedBar({ emps, setScope }) {
-  const counts = FILIALES.map((f) => ({ f, n: emps.filter((e) => e.filialeId === f.id).length }));
-  const total = counts.reduce((s, c) => s + c.n, 0);
+function ConsolidatedBar({ byFil, setScope }) {
+  const total = byFil.reduce((s, c) => s + c.effectif, 0);
   if (total === 0) return (
     <div>
       <h3 className="font-semibold mb-1" style={{ fontFamily: DISPLAY }}>Effectifs par filiale</h3>
@@ -567,21 +818,21 @@ function ConsolidatedBar({ emps, setScope }) {
       <h3 className="font-semibold mb-1" style={{ fontFamily: DISPLAY }}>Effectifs par filiale</h3>
       <p className="text-xs mb-4" style={{ color: T.muted }}>Cliquez sur une filiale pour zoomer sur son périmètre.</p>
       <div className="flex w-full rounded-lg overflow-hidden" style={{ height: 44 }}>
-        {counts.map(({ f, n }) => (
-          <button key={f.id} onClick={() => setScope(f.id)} title={`${f.nom} — ${fInt(n)} collaborateurs`}
+        {byFil.map(({ f, effectif }) => (
+          <button key={f.id} onClick={() => setScope(f.id)} title={`${f.nom} — ${fInt(effectif)} collaborateurs`}
             className="h-full transition-opacity hover:opacity-80 flex items-center justify-center"
-            style={{ width: (n / total) * 100 + "%", background: f.color, minWidth: 4 }}>
-            {n / total > 0.1 && <span className="text-xs font-semibold text-white">{Math.round((n / total) * 100)}%</span>}
+            style={{ width: (effectif / total) * 100 + "%", background: f.color, minWidth: 4 }}>
+            {effectif / total > 0.1 && <span className="text-xs font-semibold text-white">{Math.round((effectif / total) * 100)}%</span>}
           </button>
         ))}
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
-        {counts.map(({ f, n }) => (
+        {byFil.map(({ f, effectif }) => (
           <button key={f.id} onClick={() => setScope(f.id)} className="flex items-center gap-2 text-left rounded-lg px-2 py-1.5 hover:bg-gray-50">
             <FilialeDot id={f.id} />
             <span className="min-w-0">
               <span className="block text-xs font-medium truncate">{f.nom}</span>
-              <span className="block text-xs" style={{ color: T.muted, fontVariantNumeric: "tabular-nums" }}>{fInt(n)}</span>
+              <span className="block text-xs" style={{ color: T.muted, fontVariantNumeric: "tabular-nums" }}>{fInt(effectif)}</span>
             </span>
           </button>
         ))}
@@ -612,14 +863,8 @@ function DeptBreakdown({ emps, title }) {
   );
 }
 
-function FilialeComparison({ emps, leaves, setScope, setPage }) {
-  const rows = FILIALES.map((f) => {
-    const fe = emps.filter((e) => e.filialeId === f.id);
-    return {
-      f, effectif: fe.length, masse: fe.reduce((s, e) => s + e.salaire, 0),
-      attente: leaves.filter((l) => l.filialeId === f.id && l.statut === "En attente").length,
-    };
-  });
+function FilialeComparison({ byFil, setScope, setPage }) {
+  const rows = byFil;
   return (
     <div className="rounded-2xl overflow-hidden" style={{ background: T.surface, border: `1px solid ${T.line}` }}>
       <div className="px-5 py-4"><h3 className="font-semibold" style={{ fontFamily: DISPLAY }}>Comparatif des filiales</h3></div>
@@ -658,7 +903,7 @@ function FilialeComparison({ emps, leaves, setScope, setPage }) {
 }
 
 /* --------------------------- Collaborateurs --------------------------- */
-function Employes({ isDRH, emps, filIds, onAdd, userScope, payroll }) {
+function Employes({ isDRH, emps, filIds, onAdd, userScope, payroll, filiale }) {
   const [q, setQ] = useState("");
   const [fFil, setFFil] = useState("all");
   const [fContrat, setFContrat] = useState("all");
@@ -667,26 +912,60 @@ function Employes({ isDRH, emps, filIds, onAdd, userScope, payroll }) {
   const [sel, setSel] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const per = 12;
+  const debouncedQ = useDebounce(q, 350);
 
-  const filtered = useMemo(() => {
+  // apiMode : pagination + recherche côté serveur
+  const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const filialeParam = isDRH ? (fFil !== "all" ? fFil : filiale) : undefined;
+
+  async function load() {
+    setLoading(true); setError(null);
+    try {
+      const res = await getEmployees({
+        filialeId: filialeParam,
+        q: debouncedQ || undefined,
+        typeContrat: fContrat !== "all" ? fContrat : undefined,
+        page: pg + 1, perPage: per,
+      });
+      setRows(res.items); setTotal(res.total);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { if (apiMode) load(); }, [debouncedQ, fFil, fContrat, pg, filiale]); // eslint-disable-line
+  useEffect(() => { setPg(0); }, [debouncedQ, fFil, fContrat, filiale]);
+
+  async function handleAdd(payload) {
+    if (apiMode) { await createEmployee(payload); await load(); }
+    else { await onAdd(payload); }
+  }
+
+  const sortRows = (arr) => [...arr].sort((a, b) => {
+    let va, vb;
+    if (sort.key === "nom") { va = a.nom + a.prenom; vb = b.nom + b.prenom; }
+    else if (sort.key === "salaire") { va = a.salaire; vb = b.salaire; }
+    else if (sort.key === "anc") { va = a.dateEmbauche; vb = b.dateEmbauche; }
+    else { va = a[sort.key]; vb = b[sort.key]; }
+    return va > vb ? sort.dir : va < vb ? -sort.dir : 0;
+  });
+
+  let view, count, pages;
+  if (apiMode) {
+    view = sortRows(rows); // tri appliqué à la page courante (le serveur trie par nom)
+    count = total;
+    pages = Math.max(1, Math.ceil(total / per));
+  } else {
     let r = emps;
     if (q) { const s = q.toLowerCase(); r = r.filter((e) => (e.prenom + " " + e.nom + " " + e.poste + " " + e.matricule).toLowerCase().includes(s)); }
     if (fFil !== "all") r = r.filter((e) => e.filialeId === fFil);
     if (fContrat !== "all") r = r.filter((e) => e.typeContrat === fContrat);
-    r = [...r].sort((a, b) => {
-      let va, vb;
-      if (sort.key === "nom") { va = a.nom + a.prenom; vb = b.nom + b.prenom; }
-      else if (sort.key === "salaire") { va = a.salaire; vb = b.salaire; }
-      else if (sort.key === "anc") { va = a.dateEmbauche; vb = b.dateEmbauche; }
-      else { va = a[sort.key]; vb = b[sort.key]; }
-      return va > vb ? sort.dir : va < vb ? -sort.dir : 0;
-    });
-    return r;
-  }, [emps, q, fFil, fContrat, sort]);
-
-  useEffect(() => setPg(0), [q, fFil, fContrat]);
-  const pages = Math.max(1, Math.ceil(filtered.length / per));
-  const view = filtered.slice(pg * per, pg * per + per);
+    r = sortRows(r);
+    count = r.length;
+    pages = Math.max(1, Math.ceil(r.length / per));
+    view = r.slice(pg * per, pg * per + per);
+  }
   const toggleSort = (key) => setSort((s) => ({ key, dir: s.key === key ? -s.dir : 1 }));
 
   return (
@@ -712,7 +991,11 @@ function Employes({ isDRH, emps, filIds, onAdd, userScope, payroll }) {
         </button>
       </div>
 
-      <div className="text-sm" style={{ color: T.muted }}>{fInt(filtered.length)} collaborateur{filtered.length > 1 ? "s" : ""}</div>
+      <div className="flex items-center gap-2 text-sm" style={{ color: T.muted }}>
+        {loading && <RefreshCw size={13} className="animate-spin" />}
+        {fInt(count)} collaborateur{count > 1 ? "s" : ""}
+      </div>
+      {error && <ErrorNote msg={error} onClose={() => setError(null)} />}
 
       <div className="rounded-2xl overflow-hidden" style={{ background: T.surface, border: `1px solid ${T.line}` }}>
         <div className="overflow-x-auto">
@@ -758,7 +1041,7 @@ function Employes({ isDRH, emps, filIds, onAdd, userScope, payroll }) {
       </div>
 
       {sel && <EmployeeDrawer e={sel} onClose={() => setSel(null)} payroll={payroll} />}
-      {showAdd && <AddEmployee onClose={() => setShowAdd(false)} onAdd={onAdd} userScope={userScope} isDRH={isDRH} />}
+      {showAdd && <AddEmployee onClose={() => setShowAdd(false)} onAdd={handleAdd} userScope={userScope} isDRH={isDRH} />}
     </div>
   );
 }
@@ -771,10 +1054,19 @@ function Th({ children, onClick, active, right }) {
 }
 
 function EmployeeDrawer({ e, onClose, payroll }) {
-  const cnss = cnssSalarie(e.salaire, payroll);
-  const tax = iuts(e.salaire - cnss, payroll);
-  const net = e.salaire - cnss - tax;
-  const patron = cnssPatronal(e.salaire, payroll);
+  const [slip, setSlip] = useState(null);
+  useEffect(() => {
+    if (!apiMode) return;
+    let alive = true;
+    getPayslip(e.id).then((s) => { if (alive) setSlip(s); }).catch(() => {});
+    return () => { alive = false; };
+  }, [e.id]);
+
+  // apiMode : bulletin calculé par le serveur ; sinon calcul local avec le barème.
+  const cnss = apiMode ? (slip?.cnssSalarie ?? 0) : cnssSalarie(e.salaire, payroll);
+  const tax = apiMode ? (slip?.iuts ?? 0) : iuts(e.salaire - cnss, payroll);
+  const net = apiMode ? (slip?.net ?? 0) : e.salaire - cnss - tax;
+  const patron = apiMode ? (slip?.cnssPatronal ?? 0) : cnssPatronal(e.salaire, payroll);
   return (
     <div className="fixed inset-0 z-50 flex justify-end" style={{ background: "rgba(7,18,11,.45)" }} onClick={onClose}>
       <div className="w-full max-w-md h-full overflow-y-auto" style={{ background: T.surface }} onClick={(ev) => ev.stopPropagation()}>
@@ -834,20 +1126,27 @@ function Row({ k, v, strong, accent, muted, warn }) {
 
 function AddEmployee({ onClose, onAdd, userScope, isDRH }) {
   const [form, setForm] = useState({ prenom: "", nom: "", filialeId: isDRH ? "gcm" : userScope, departement: "Production", poste: "", typeContrat: "CDI", salaire: "" });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const valid = form.prenom && form.nom && form.poste && form.salaire;
-  function submit() {
-    if (!valid) return;
-    const f = FIL[form.filialeId];
-    const seq = Math.floor(Math.random() * 9000 + 1000);
-    onAdd({
-      id: "E" + Date.now(), matricule: `${f.court.toUpperCase()}-26-${seq}`, prenom: form.prenom, nom: form.nom,
-      genre: PRENOMS_F.includes(form.prenom) ? "F" : "H", filialeId: form.filialeId, poste: form.poste,
-      departement: form.departement, niveau: 2, typeContrat: form.typeContrat, salaire: Number(form.salaire),
-      dateEmbauche: TODAY, cddFin: form.typeContrat === "CDI" ? null : new Date(TODAY.getTime() + 365 * 864e5),
-      statut: "Actif", soldeConges: 0, email: "", tel: "",
-    });
-    onClose();
+  async function submit() {
+    if (!valid || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onAdd({
+        prenom: form.prenom, nom: form.nom,
+        genre: PRENOMS_F.includes(form.prenom) ? "F" : "H",
+        filialeId: form.filialeId, poste: form.poste, departement: form.departement,
+        niveau: 2, typeContrat: form.typeContrat, salaire: Number(form.salaire),
+      });
+      onClose();
+    } catch (e) {
+      setErr(e.message || "Création impossible");
+    } finally {
+      setBusy(false);
+    }
   }
   const inp = { background: T.bg, border: `1px solid ${T.line}` };
   return (
@@ -870,9 +1169,16 @@ function AddEmployee({ onClose, onAdd, userScope, isDRH }) {
           <label className="space-y-1"><span className="text-xs" style={{ color: T.muted }}>Contrat</span><select value={form.typeContrat} onChange={set("typeContrat")} className="w-full rounded-lg px-3 py-2 outline-none" style={inp}>{CT_LABEL.map((c) => <option key={c}>{c}</option>)}</select></label>
           <label className="space-y-1"><span className="text-xs" style={{ color: T.muted }}>Salaire brut (FCFA)</span><input value={form.salaire} onChange={set("salaire")} type="number" className="w-full rounded-lg px-3 py-2 outline-none" style={inp} /></label>
         </div>
+        {err && (
+          <div className="mx-5 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: T.dangerSoft, color: T.danger }}>
+            <AlertTriangle size={14} /> {err}
+          </div>
+        )}
         <div className="flex justify-end gap-2 px-5 py-4" style={{ borderTop: `1px solid ${T.line}` }}>
-          <button onClick={onClose} className="rounded-lg px-4 py-2 text-sm" style={{ border: `1px solid ${T.line}` }}>Annuler</button>
-          <button onClick={submit} disabled={!valid} className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" style={{ background: T.primary }}>Enregistrer</button>
+          <button onClick={onClose} disabled={busy} className="rounded-lg px-4 py-2 text-sm disabled:opacity-40" style={{ border: `1px solid ${T.line}` }}>Annuler</button>
+          <button onClick={submit} disabled={!valid || busy} className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" style={{ background: T.primary }}>
+            {busy ? <><RefreshCw size={14} className="animate-spin" /> Enregistrement…</> : "Enregistrer"}
+          </button>
         </div>
       </div>
     </div>
@@ -880,34 +1186,66 @@ function AddEmployee({ onClose, onAdd, userScope, isDRH }) {
 }
 
 /* --------------------------- Congés --------------------------- */
-function Conges({ leaves, empById, onLeave, isDRH }) {
+function Conges({ leaves, empById, onLeave, isDRH, filiale }) {
   const [tab, setTab] = useState("En attente");
   const tabs = ["En attente", "Approuvé", "Refusé"];
-  const list = leaves.filter((l) => l.statut === tab);
+  const [all, setAll] = useState([]);
+  const [loading, setLoading] = useState(apiMode);
+  const [error, setError] = useState(null);
+
+  async function load() {
+    setLoading(true); setError(null);
+    try { setAll(await getLeaves({ filialeId: filiale })); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { if (apiMode) load(); }, [filiale]); // eslint-disable-line
+
+  async function decide(id, decision) {
+    try { await decideLeave(id, decision); await load(); }
+    catch (e) { setError(e.message); }
+  }
+
+  const source = apiMode ? all : leaves;
+  const decideFn = apiMode ? decide : onLeave;
+  const list = source.filter((l) => l.statut === tab);
+  const nameOf = (l) => {
+    if (apiMode) return l.employeNom || "—";
+    const e = empById[l.empId];
+    return e ? `${e.prenom} ${e.nom}` : "—";
+  };
+  const posteOf = (l) => (apiMode ? "" : empById[l.empId]?.poste || "");
+  const initials = (name) => name.split(" ").filter(Boolean).slice(0, 2).map((s) => s[0]).join("");
+
   return (
     <div className="space-y-4">
-      <div className="flex gap-2">
-        {tabs.map((t) => {
-          const n = leaves.filter((l) => l.statut === t).length;
-          const active = tab === t;
-          return (
-            <button key={t} onClick={() => setTab(t)} className="rounded-lg px-4 py-2 text-sm font-medium flex items-center gap-2"
-              style={{ background: active ? T.primary : T.surface, color: active ? "#fff" : "#374151", border: `1px solid ${active ? T.primary : T.line}` }}>
-              {t} <span className="rounded-full px-1.5 text-xs" style={{ background: active ? "rgba(255,255,255,.2)" : T.bg }}>{n}</span>
-            </button>
-          );
-        })}
+      {error && <ErrorNote msg={error} onClose={() => setError(null)} />}
+      <div className="flex items-center gap-2">
+        <div className="flex gap-2">
+          {tabs.map((t) => {
+            const n = source.filter((l) => l.statut === t).length;
+            const active = tab === t;
+            return (
+              <button key={t} onClick={() => setTab(t)} className="rounded-lg px-4 py-2 text-sm font-medium flex items-center gap-2"
+                style={{ background: active ? T.primary : T.surface, color: active ? "#fff" : "#374151", border: `1px solid ${active ? T.primary : T.line}` }}>
+                {t} <span className="rounded-full px-1.5 text-xs" style={{ background: active ? "rgba(255,255,255,.2)" : T.bg }}>{n}</span>
+              </button>
+            );
+          })}
+        </div>
+        {loading && <RefreshCw size={15} className="animate-spin" color={T.muted} />}
       </div>
       <div className="rounded-2xl overflow-hidden" style={{ background: T.surface, border: `1px solid ${T.line}` }}>
         {list.length === 0 && <div className="py-16 text-center text-sm" style={{ color: T.muted }}>Aucune demande dans cette catégorie.</div>}
         <div className="divide-y" style={{ borderColor: T.line }}>
           {list.slice(0, 40).map((l) => {
-            const e = empById[l.empId];
+            const name = nameOf(l);
+            const poste = posteOf(l);
             return (
               <div key={l.id} className="flex flex-wrap items-center gap-3 px-4 py-3" style={{ borderTop: `1px solid ${T.line}` }}>
-                <span className="flex items-center justify-center rounded-full text-xs font-semibold shrink-0" style={{ width: 34, height: 34, background: FIL[l.filialeId].color + "22" }}>{e.prenom[0]}{e.nom[0]}</span>
+                <span className="flex items-center justify-center rounded-full text-xs font-semibold shrink-0" style={{ width: 34, height: 34, background: FIL[l.filialeId].color + "22" }}>{initials(name)}</span>
                 <div className="min-w-0 flex-1">
-                  <div className="font-medium text-sm">{e.prenom} {e.nom} <span className="text-xs font-normal" style={{ color: T.muted }}>· {e.poste}</span></div>
+                  <div className="font-medium text-sm">{name}{poste && <span className="text-xs font-normal" style={{ color: T.muted }}> · {poste}</span>}</div>
                   <div className="text-xs flex items-center gap-2 flex-wrap" style={{ color: T.muted }}>
                     {isDRH && <Chip id={l.filialeId} />}
                     <span>{l.type}</span><span>·</span><span>{fDate(l.debut)} → {fDate(l.fin)}</span><span>·</span><span>{l.jours} j</span>
@@ -915,8 +1253,8 @@ function Conges({ leaves, empById, onLeave, isDRH }) {
                 </div>
                 {l.statut === "En attente" ? (
                   <div className="flex gap-2">
-                    <button onClick={() => onLeave(l.id, "Approuvé")} className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold text-white" style={{ background: T.primary }}><Check size={13} /> Approuver</button>
-                    <button onClick={() => onLeave(l.id, "Refusé")} className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold" style={{ background: "#fff", border: `1px solid ${T.line}`, color: T.danger }}><X size={13} /> Refuser</button>
+                    <button onClick={() => decideFn(l.id, "Approuvé")} className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold text-white" style={{ background: T.primary }}><Check size={13} /> Approuver</button>
+                    <button onClick={() => decideFn(l.id, "Refusé")} className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold" style={{ background: "#fff", border: `1px solid ${T.line}`, color: T.danger }}><X size={13} /> Refuser</button>
                   </div>
                 ) : <StatusBadge s={l.statut} />}
               </div>
@@ -1085,22 +1423,83 @@ function Mini({ k, v }) {
 }
 
 /* --------------------------- Paramètres (DRH) --------------------------- */
-function Parametres({ payroll, setPayroll, counts, onClear, onRegen }) {
+function Parametres({ payroll: payrollProp, setPayroll: setPayrollProp, counts, onClear, onRegen }) {
   const [test, setTest] = useState(250000);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [cfg, setCfg] = useState(null);
+  const [sim, setSim] = useState(null);
+  const [dataCounts, setDataCounts] = useState(counts);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const saveTimer = useRef(null);
   const num = (v) => (v === "" ? 0 : parseFloat(v));
+
+  // apiMode : barème détenu localement et persisté via l'API ; sinon barème en mémoire (props).
+  const payroll = apiMode ? cfg : payrollProp;
+  function setPayroll(updater) {
+    if (!apiMode) { setPayrollProp(updater); return; }
+    setCfg((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(() => { updatePayrollConfig(next).catch((e) => setError(e.message)); }, 700);
+      return next;
+    });
+  }
+
+  async function loadCounts() {
+    try {
+      const [stats, lv] = await Promise.all([getFilialesStats(), getLeaves({})]);
+      setDataCounts({ emps: stats.reduce((s, x) => s + x.effectif, 0), leaves: lv.length });
+    } catch { /* ignore */ }
+  }
+  useEffect(() => {
+    if (!apiMode) return;
+    getPayrollConfig().then(setCfg).catch((e) => setError(e.message));
+    loadCounts();
+  }, []);
+
+  // Simulateur : bulletin calculé par le serveur en apiMode.
+  useEffect(() => {
+    if (!apiMode) return;
+    const t = setTimeout(() => { previewPayslip(test).then(setSim).catch(() => {}); }, 350);
+    return () => clearTimeout(t);
+  }, [test, cfg]);
+
+  async function resetBareme() {
+    if (apiMode) { try { setCfg(await resetPayrollConfig()); } catch (e) { setError(e.message); } }
+    else setPayrollProp(DEFAULT_PAYROLL);
+  }
+  async function doClear() {
+    if (apiMode) { setBusy(true); try { await clearDatabase(); await loadCounts(); } catch (e) { setError(e.message); } finally { setBusy(false); } }
+    else onClear();
+    setConfirmClear(false);
+  }
+  async function doRegen() {
+    if (apiMode) { setBusy(true); try { await seedDemo(); await loadCounts(); } catch (e) { setError(e.message); } finally { setBusy(false); } }
+    else onRegen();
+  }
+
   const updBracket = (i, k, v) => setPayroll((p) => ({ ...p, iuts: p.iuts.map((b, j) => (j === i ? { ...b, [k]: v } : b)) }));
   const addBracket = () => setPayroll((p) => { const a = [...p.iuts]; a.splice(a.length - 1, 0, { ceil: 300000, rate: 22 }); return { ...p, iuts: a }; });
   const delBracket = (i) => setPayroll((p) => ({ ...p, iuts: p.iuts.filter((_, j) => j !== i) }));
 
-  const cnss = cnssSalarie(test, payroll);
-  const tax = iuts(test - cnss, payroll);
-  const net = test - cnss - tax;
-  const patron = cnssPatronal(test, payroll);
+  if (apiMode && !payroll) {
+    return <div className="flex items-center gap-2 text-sm" style={{ color: T.muted }}><RefreshCw size={15} className="animate-spin" /> Chargement du barème…</div>;
+  }
+
+  const lCnss = cnssSalarie(test, payroll);
+  const lTax = iuts(test - lCnss, payroll);
+  const lPat = cnssPatronal(test, payroll);
+  const cnss = apiMode ? (sim?.cnssSalarie ?? 0) : lCnss;
+  const tax = apiMode ? (sim?.iuts ?? 0) : lTax;
+  const net = apiMode ? (sim?.net ?? 0) : test - lCnss - lTax;
+  const cout = apiMode ? (sim?.coutEmployeur ?? 0) : test + lPat;
+  const shownCounts = apiMode ? dataCounts : counts;
   const inp = { background: T.bg, border: `1px solid ${T.line}` };
 
   return (
     <div className="space-y-4 max-w-4xl">
+      {error && <ErrorNote msg={error} onClose={() => setError(null)} />}
       {/* Barème de paie */}
       <div className="rounded-2xl p-5" style={{ background: T.surface, border: `1px solid ${T.line}` }}>
         <div className="flex items-center gap-2 mb-1"><SlidersHorizontal size={18} color={T.primary} /><h3 className="font-semibold" style={{ fontFamily: DISPLAY }}>Barème de paie</h3></div>
@@ -1140,7 +1539,7 @@ function Parametres({ payroll, setPayroll, counts, onClear, onRegen }) {
             );
           })}
         </div>
-        <button onClick={() => setPayroll(DEFAULT_PAYROLL)} className="mt-4 flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium" style={{ border: `1px solid ${T.line}` }}><RefreshCw size={14} /> Réinitialiser le barème officiel</button>
+        <button onClick={resetBareme} className="mt-4 flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium" style={{ border: `1px solid ${T.line}` }}><RefreshCw size={14} /> Réinitialiser le barème officiel</button>
 
         {/* Simulateur */}
         <div className="mt-5 rounded-xl p-4" style={{ background: T.bg }}>
@@ -1153,7 +1552,7 @@ function Parametres({ payroll, setPayroll, counts, onClear, onRegen }) {
             <Mini k="CNSS salarié" v={fInt(cnss)} />
             <Mini k="IUTS" v={fInt(tax)} />
             <Mini k="Net estimé" v={fInt(net)} />
-            <Mini k="Coût employeur" v={fInt(test + patron)} />
+            <Mini k="Coût employeur" v={fInt(cout)} />
           </div>
         </div>
       </div>
@@ -1161,20 +1560,20 @@ function Parametres({ payroll, setPayroll, counts, onClear, onRegen }) {
       {/* Gestion des données */}
       <div className="rounded-2xl p-5" style={{ background: T.surface, border: `1px solid ${T.line}` }}>
         <div className="flex items-center gap-2 mb-1"><Database size={18} color={T.primary} /><h3 className="font-semibold" style={{ fontFamily: DISPLAY }}>Gestion des données</h3></div>
-        <p className="text-sm mb-4" style={{ color: T.muted }}>Données chargées en mémoire : <strong>{fInt(counts.emps)}</strong> collaborateurs · <strong>{fInt(counts.leaves)}</strong> demandes de congé.</p>
+        <p className="text-sm mb-4" style={{ color: T.muted }}>{apiMode ? "Base" : "Données en mémoire"} : <strong>{fInt(shownCounts.emps)}</strong> collaborateurs · <strong>{fInt(shownCounts.leaves)}</strong> demandes de congé.</p>
         <div className="flex flex-wrap gap-2">
-          <button onClick={onRegen} className="flex items-center gap-1.5 rounded-lg px-4 py-2.5 text-sm font-semibold text-white" style={{ background: T.primary }}><RefreshCw size={15} /> Régénérer les données de démonstration</button>
+          <button onClick={doRegen} disabled={busy} className="flex items-center gap-1.5 rounded-lg px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50" style={{ background: T.primary }}><RefreshCw size={15} className={busy ? "animate-spin" : ""} /> Régénérer les données de démonstration</button>
           {!confirmClear ? (
-            <button onClick={() => setConfirmClear(true)} className="flex items-center gap-1.5 rounded-lg px-4 py-2.5 text-sm font-semibold" style={{ background: T.dangerSoft, color: T.danger }}><Trash2 size={15} /> Vider la base</button>
+            <button onClick={() => setConfirmClear(true)} disabled={busy} className="flex items-center gap-1.5 rounded-lg px-4 py-2.5 text-sm font-semibold disabled:opacity-50" style={{ background: T.dangerSoft, color: T.danger }}><Trash2 size={15} /> Vider la base</button>
           ) : (
             <div className="flex items-center gap-2 rounded-lg px-3 py-1.5" style={{ background: T.dangerSoft }}>
               <span className="text-sm font-medium" style={{ color: T.danger }}>Tout supprimer ?</span>
-              <button onClick={() => { onClear(); setConfirmClear(false); }} className="rounded-lg px-3 py-1.5 text-sm font-semibold text-white" style={{ background: T.danger }}>Confirmer</button>
+              <button onClick={doClear} disabled={busy} className="rounded-lg px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50" style={{ background: T.danger }}>Confirmer</button>
               <button onClick={() => setConfirmClear(false)} className="rounded-lg px-3 py-1.5 text-sm" style={{ border: `1px solid ${T.line}`, background: "#fff" }}>Annuler</button>
             </div>
           )}
         </div>
-        <p className="text-xs mt-3" style={{ color: T.muted }}>« Vider la base » efface tous les collaborateurs et demandes en mémoire. Action immédiate et réversible via la régénération.</p>
+        <p className="text-xs mt-3" style={{ color: T.muted }}>« Vider la base » efface tous les collaborateurs et demandes de congé{apiMode ? " côté serveur" : " en mémoire"}. Réversible via la régénération des données de démonstration.</p>
       </div>
     </div>
   );
